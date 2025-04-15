@@ -1,22 +1,26 @@
 import asyncio
 import pickle
-import time
 import logging
-from io import BytesIO
+import json
 import willump
+from io import BytesIO
 import pycurl
+from selenium import webdriver
 import bs4
 import numpy as np
 import pandas as pd
+import sys
+import random
+from PySide6 import QtCore, QtWidgets, QtGui
 
+in_champ_select = False
+synergies_need_update = False
+unpickable_ids = []
 teammate_champ = ''
-pickable_ids = []
-teammate_update_count = 0
-pickable_update_count = 0
 
-async def update_champ_mapping():
-    wllp = await willump.start()
-    available_champs_response = await wllp.request('get', '/lol-champions/v1/owned-champions-minimal')
+async def update_champ_mapping(wllp):
+    available_champs_response = await wllp.request(
+        'get', '/lol-champions/v1/owned-champions-minimal')
     available_champs = await available_champs_response.json()
     mapping_champ_to_id = {}
     for champ in available_champs:
@@ -24,7 +28,6 @@ async def update_champ_mapping():
     with open('mapping_champ_to_id.pkl', 'wb') as file:
         pickle.dump(mapping_champ_to_id, file)
     logging.debug('Champ mapping updated')
-    await wllp.close()
 
 def update_synergies_opgg():
     with open('mapping_champ_to_id.pkl', 'rb') as file:
@@ -32,12 +35,16 @@ def update_synergies_opgg():
     synergy_list = []
     index_list = []
     for champ_name in mapping_champ_to_id.keys():
-        logging.debug(f'Getting synergies for {champ_name}')
+        logging.info(f'Getting synergies for {champ_name}')
         synergy_list.append(get_synergies_opgg(champ_name))
-        logging.debug(f'Got synergies for {champ_name}')
+        logging.info(f'Got synergies for {champ_name}')
         index_list.append(champ_name)
+    logging.info('Getting overall winrates')
+    index_list.append('')
+    synergy_list.append(get_overall_opgg())
+    logging.info('Got overall winrates')
     synergy_df = pd.DataFrame(synergy_list, index=index_list).T
-    synergy_df[''] = get_overall_opgg()[0:synergy_df.shape[0]]
+    # synergy_df[''] = get_overall_opgg()[0:synergy_df.shape[0]]
     with open('arena_champs_ranking.pkl', 'wb') as file:
         pickle.dump(synergy_df, file)
 
@@ -52,14 +59,14 @@ def get_synergies_opgg(champ_name):
     buffer = BytesIO()
     c = pycurl.Curl()
     c.setopt(c.URL,
-             f"https://www.op.gg/modes/arena/{url_name}/synergies?region=global&patch=15.06")
+             f"https://www.op.gg/modes/arena/{url_name}/synergies?patch=15.07&region=global")
     c.setopt(c.WRITEDATA, buffer)
     c.perform()
     c.close()
     body = buffer.getvalue()
     soup = bs4.BeautifulSoup(body, 'html.parser')
     synergy_table = soup.find(
-        'caption', string=f'{champ_name} synergies').find_parent('table')
+        'div', string=f'Synergies').find_next('table')
     champ_infos = synergy_table.find_next('tbody').find_all('td')
     champ_info_list = []
     for td in champ_infos:
@@ -67,27 +74,35 @@ def get_synergies_opgg(champ_name):
     champ_info_df = pd.DataFrame(
         np.array(champ_info_list).reshape(-1, 5),
         columns=[
-            'Champion', 'Average Place', 'First Rate', 'Win Rate', 'Pick Rate'
+            'Champion', 'Average Place', 'First Rate', 'Pick Rate', 'Win Rate'
         ]).sort_values(by='First Rate', ascending=False, key=series_str_percent_int)
     return champ_info_df['Champion'].values
 
 def get_overall_opgg():
-    buffer = BytesIO()
-    c = pycurl.Curl()
-    c.setopt(
-        c.URL,
-        f"https://www.op.gg/modes/arena")
-    c.setopt(c.WRITEDATA, buffer)
-    c.perform()
-    c.close()
-    body = buffer.getvalue()
-    soup = bs4.BeautifulSoup(body, 'html.parser')
-    champion_table = soup.find('caption', string='Champions Rank').find_parent('table')
+    url = 'https://www.op.gg/modes/arena'
+    # buffer = BytesIO()
+    # c = pycurl.Curl()
+    # c.setopt(
+    #     c.URL,
+    #     url)
+    # c.setopt(c.WRITEDATA, buffer)
+    # c.perform()
+    # c.close()
+    # body = buffer.getvalue()
+    driver = webdriver.Edge()
+    driver.get(url)
+    html_content = driver.page_source
+    soup = bs4.BeautifulSoup(html_content, 'html.parser')
+    driver.quit()
+    champion_table = soup.find('th', string='Rank').find_parent('table')
     champ_infos = champion_table.find_next('tbody').find_all('tr')
     champ_info_list = []
     for tr in champ_infos:
-        champ_name = tr.find_next('strong').text
-        win_rate = tr.find_all('td')[-1].text
+        strong = tr.find('strong')
+        if strong is None:
+            continue
+        champ_name = strong.text
+        win_rate = tr.find_all('td')[-2].text
         champ_info_list.append([champ_name, win_rate])
     champ_info_df = pd.DataFrame(champ_info_list, columns=['Champion', 'Win Rate']
                                  ).sort_values(
@@ -103,77 +118,62 @@ def series_str_percent_int(series):
         rep_list.append(rep_int)
     return pd.Series(rep_list)
 
-async def update_completions():
-    wllp = await willump.start()
+async def update_completions(wllp):
     challenges_response = await wllp.request('get', '/lol-challenges/v1/challenges/local-player')
     challenges_json = await challenges_response.json()
     with open('Situations_Adapted_To.pkl', 'wb') as file:
         pickle.dump(challenges_json['602002']['completedIds'], file)
-    logging.debug('Completions updated')
-    await wllp.close()
+    logging.info('Completions updated')
 
-async def check_for_champ_select():
-    wllp = await willump.start()
-    in_champ_select = False
-    while not in_champ_select:
-        session_response = await wllp.request(
-            'get', '/lol-champ-select/v1/session')
-        session_json = await session_response.json()
-        try:
-            local_player_cell_id = session_json["localPlayerCellId"]
-            in_champ_select = True
-            await get_champ_select_info(local_player_cell_id, wllp)
-        except KeyError:
-            logging.debug('Not in champ select yet')
-            await asyncio.sleep(1)
-    await wllp.close()
-
-async def get_champ_select_info(local_player_cell_id, wllp):
-    # TODO Handle dodges
-    if local_player_cell_id % 2 == 0:
-        teammate_cell_id = local_player_cell_id + 1
-    else:
-        teammate_cell_id = local_player_cell_id - 1
+async def champ_select_loop(wllp):
+    global synergies_need_update
     everything_subscription = await wllp.subscribe(
         'OnJsonApiEvent', default_handler=None)
-    wllp.subscription_filter_endpoint(
-        everything_subscription, f'/lol-champ-select/v1/summoners/{teammate_cell_id}',
-    handler=update_teammate_champ)
-    wllp.subscription_filter_endpoint(
-        everything_subscription, '/lol-champ-select/v1/pickable-champion-ids',
-        handler=update_pickable_ids)
-    for _ in range(5):
-        await asyncio.sleep(0.1)
-    if teammate_update_count == 0 or pickable_update_count == 0:
-        print(f'Update counts received are '
-              f'{teammate_update_count} and {pickable_update_count}')
-        pickable_response = await wllp.request(
-            'get', '/lol-champ-select/v1/pickable-champion-ids')
-        pickable_info = await pickable_response.json()
-        await update_pickable_ids(pickable_info)
-        teammate_response = await wllp.request(
-            'get', f'/lol-champ-select/v1/summoners/{teammate_cell_id}')
-        teammate_info = await teammate_response.json()
-        await update_teammate_champ(teammate_info)
-    for _ in range(100):
-        logging.debug('Waiting for updates')
+    everything_subscription.filter_endpoint(
+        '/lol-champ-select/v1/session', handler=session_handler)
+    everything_subscription.filter_endpoint(
+        '/lol-champ-select/v1/summoners/', handler=summoner_handler)
+    while not in_champ_select:
+        logging.debug('Waiting for champ select session to start')
         await asyncio.sleep(1)
+    print('Champ select session started')
+    pickable_ids_response = await wllp.request(
+        'get', '/lol-lobby-team-builder/champ-select/v1/pickable-champion-ids')
+    pickable_ids = await pickable_ids_response.json()
+    anvils_response = await wllp.request(
+        'get', '/lol-lobby-team-builder/champ-select/v1/crowd-favorte-champion-list')
+    anvil_ids = await anvils_response.json()
+    while in_champ_select:
+        if synergies_need_update:
+            show_synergies(pickable_ids, anvil_ids)
+            synergies_need_update = False
+        await asyncio.sleep(1)
+    print('Champ select session ended')
 
-async def update_teammate_champ(data):
+async def session_handler(msg):
+    global in_champ_select
+    if msg['eventType'] == 'Create' or msg['eventType'] == 'Update':
+        in_champ_select = True
+    else:
+        in_champ_select = False
+
+async def summoner_handler(msg):
     global teammate_champ
-    global teammate_update_count
-    teammate_champ = data['championName']
-    teammate_update_count += 1
-    show_synergies()
+    global unpickable_ids
+    global synergies_need_update
+    if msg['data']['isSelf']:
+        return
+    if msg['data']['nameVisibilityType'] == 'VISIBLE':
+        teammate_champ = msg['data']['championName']
+        synergies_need_update = True
+    if msg['data']['championId'] not in unpickable_ids:
+        unpickable_ids.append(msg['data']['championId'])
+        synergies_need_update = True
+    if msg['data']['banIntentChampionId'] not in unpickable_ids:
+        unpickable_ids.append(msg['data']['banIntentChampionId'])
+        synergies_need_update = True
 
-async def update_pickable_ids(data):
-    global pickable_ids
-    global pickable_update_count
-    pickable_ids = data
-    pickable_update_count += 1
-    show_synergies()
-
-def show_synergies():
+def show_synergies(pickable_ids, anvil_ids):
     print(f'Teammate champ: {teammate_champ}')
     with open('mapping_champ_to_id.pkl', 'rb') as file:
         mapping_champ_to_id = pickle.load(file)
@@ -181,29 +181,49 @@ def show_synergies():
         arena_champs_ranking = pickle.load(file)
     with open('Situations_Adapted_To.pkl', 'rb') as file:
         completed_ids = pickle.load(file)
+    anvil_synergies = []
     best_playable_synergies = []
     for champ in arena_champs_ranking[teammate_champ]:
+        if champ is None:
+            continue
         champ_id = mapping_champ_to_id[champ]
-        if champ_id not in completed_ids and champ_id in pickable_ids:
-            best_playable_synergies.append(champ)
+        if champ_id in unpickable_ids or champ_id in completed_ids or champ_id not in pickable_ids:
+            continue
+        if champ_id in anvil_ids:
+            anvil_synergies.append(champ)
+        best_playable_synergies.append(champ)
     if len(best_playable_synergies) == 0:
         logging.debug('No playable synergies found')
         for champ in arena_champs_ranking['']:
+            if champ is None:
+                continue
             champ_id = mapping_champ_to_id[champ]
             if champ_id not in completed_ids and champ_id in pickable_ids:
                 best_playable_synergies.append(champ)
+    if len(anvil_synergies) == 0:
+        print('No anvil synergies found')
+    else:
+        print(f'Anvil synergies:')
+        print(*anvil_synergies, sep='\n')
     print(f'Best playable synergies:')
     print(*best_playable_synergies[:5], sep='\n')
+    print('')
 
-def main():
-    # asyncio.run(update_champ_mapping())
+# class MainWindow(QtWidgets.QMenu):
+
+async def main():
+    # TODO clean(willump fork: msg size, logging) , gui
+    # logging.basicConfig(level=logging.INFO)
     # update_synergies_opgg()
-    # asyncio.run(update_completions())
-    # logging.basicConfig(level=logging.DEBUG)
-    while True:
-        asyncio.run(check_for_champ_select())
-        time.sleep(1)
-
+    wllp = await willump.start()
+    try:
+        # await update_champ_mapping(wllp)
+        while True:
+            await update_completions(wllp)
+            await champ_select_loop(wllp)
+        pass
+    finally:
+        await wllp.close()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
